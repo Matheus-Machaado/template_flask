@@ -1,0 +1,9 @@
+mysql-connector-python
+schedule
+Flask
+flask-cors
+beautifulsoup4
+python-docx
+pymupdf
+python-dotenv
+docx2pdf
