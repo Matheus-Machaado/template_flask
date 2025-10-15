@@ -76,7 +76,7 @@ def _setup_logging():
 logger = _setup_logging()
 
 # === CONFIG / DB / HELPERS ===
-DB_CFG = dict(
+db_config = dict(
     host = os.getenv("DB_HOST"),
     port = os.getenv("DB_PORT"),
     user = os.getenv("DB_USER"),
@@ -88,8 +88,52 @@ DB_CFG = dict(
 )
 
 def get_connection():
-    """Abre e retorna uma conexão MySQL usando a configuração padrão."""
-    return mysql.connector.connect(**DB_CFG)
+    """
+    Abre e retorna uma conexão MySQL baseada em db_config, com validações,
+    timeout e logs — sem derrubar o processo em caso de erro.
+    """
+    cfg = db_config.copy()
+
+    # Remova chaves None/vazias (evita bugs do connector)
+    cfg = {k: v for k, v in cfg.items() if v not in (None, "", "None")}
+
+    # Campos obrigatórios
+    obrig = ("host", "user", "password", "database")
+    faltando = [k for k in obrig if k not in cfg]
+    if faltando:
+        msg = f"Variáveis de ambiente do DB faltando: {faltando}"
+        error_logger.error(msg)
+        raise RuntimeError(msg)
+
+    # Porta como int (se vier string)
+    if "port" in cfg:
+        try:
+            cfg["port"] = int(cfg["port"])
+        except Exception:
+            error_logger.warning("DB_PORT inválida (%r); removendo.", cfg["port"])
+            cfg.pop("port", None)
+
+    # Evita crash do connector com auth_plugin inválido
+    if "auth_plugin" in cfg and cfg["auth_plugin"].lower() not in (
+        "mysql_native_password", "caching_sha2_password"
+    ):
+        error_logger.warning("auth_plugin desconhecido (%r); removendo.", cfg["auth_plugin"])
+        cfg.pop("auth_plugin", None)
+
+    # Força timeout e modo puro python
+    cfg.setdefault("connection_timeout", 10)
+    cfg.setdefault("autocommit", True)
+    cfg.setdefault("use_pure", True)  # evita extensões C
+
+    try:
+        cnx = mysql.connector.connect(**cfg)
+        return cnx
+    except mysql.connector.Error as e:
+        error_logger.error("MySQL connector error: %s", e, exc_info=True)
+        raise
+    except Exception as e:
+        error_logger.error("Falha inesperada ao conectar MySQL: %s", e, exc_info=True)
+        raise
 
 def executar(sql, params=()):
     """Executa INSERT/UPDATE/DELETE simples e retorna lastrowid (quando houver)."""
