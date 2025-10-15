@@ -2215,7 +2215,8 @@ def download_pdf():
             download_name=download_name,
             mimetype="application/pdf"
         )
-    except Exception:
+    except Exception as e:
+        print(e)
         logger.exception("/download_pdf: falha ao gerar PDF")
         return jsonify(status="erro", mensagem="Falha ao gerar PDF"), 500
 
