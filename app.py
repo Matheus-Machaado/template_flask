@@ -102,7 +102,7 @@ def get_connection():
     faltando = [k for k in obrig if k not in cfg]
     if faltando:
         msg = f"Variáveis de ambiente do DB faltando: {faltando}"
-        error_logger.error(msg)
+        logger.error(msg)
         raise RuntimeError(msg)
 
     # Porta como int (se vier string)
@@ -110,14 +110,14 @@ def get_connection():
         try:
             cfg["port"] = int(cfg["port"])
         except Exception:
-            error_logger.warning("DB_PORT inválida (%r); removendo.", cfg["port"])
+            logger.warning("DB_PORT inválida (%r); removendo.", cfg["port"])
             cfg.pop("port", None)
 
     # Evita crash do connector com auth_plugin inválido
     if "auth_plugin" in cfg and cfg["auth_plugin"].lower() not in (
         "mysql_native_password", "caching_sha2_password"
     ):
-        error_logger.warning("auth_plugin desconhecido (%r); removendo.", cfg["auth_plugin"])
+        logger.warning("auth_plugin desconhecido (%r); removendo.", cfg["auth_plugin"])
         cfg.pop("auth_plugin", None)
 
     # Força timeout e modo puro python
@@ -129,10 +129,10 @@ def get_connection():
         cnx = mysql.connector.connect(**cfg)
         return cnx
     except mysql.connector.Error as e:
-        error_logger.error("MySQL connector error: %s", e, exc_info=True)
+        logger.error("MySQL connector error: %s", e, exc_info=True)
         raise
     except Exception as e:
-        error_logger.error("Falha inesperada ao conectar MySQL: %s", e, exc_info=True)
+        logger.error("Falha inesperada ao conectar MySQL: %s", e, exc_info=True)
         raise
 
 def executar(sql, params=()):
