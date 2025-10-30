@@ -1221,6 +1221,18 @@ def alterar_status():
 
 @app.route("/reverter_alteracao", methods=["POST"])
 def reverter_alteracao():
+    """
+    Reverte um item listado na aba Alterações.
+
+    Casos suportados:
+      1) variação de conteúdo  -> status='alterado' e alteracao='alterado'
+         => promove a variação a principal e remove o pai (como já era)
+      2) item deletado          -> status='alterado' e alteracao='deletado' (ou status='deletado')
+         => restaura o item (ou pasta + filhos) zerando status/alteracao e limpando locks
+            - pasta: restaura em cascata; se houver conflito de nome, renomeia a pasta
+              e ajusta o caminho de todos os filhos
+            - arquivo: garante nome único no caminho de destino
+    """
     data = request.get_json(force=True) or {}
     id_alt = data.get("id_alteracao") or data.get("id")
     usuario_req = (data.get("usuario") or data.get("id_usuario") or "").strip()
@@ -1230,80 +1242,197 @@ def reverter_alteracao():
 
     try:
         with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
-            # 1) variação
+            # Carrega o registro alvo
             cur.execute("""
                 SELECT id_template, id_origem, status, alteracao,
-                       nome_arquivo, caminho, type
+                       nome_arquivo, caminho, type,
+                       em_uso, em_uso_modo, em_uso_por
                   FROM galeria_juridico
                  WHERE id_template = %s
             """, (id_alt,))
             var = cur.fetchone()
             if not var:
-                return jsonify(status="erro", mensagem="Variação não encontrada"), 404
-            if (var.get("status") or "").lower() != "alterado" or (var.get("alteracao") or "").lower() != "alterado":
-                return jsonify(status="erro", mensagem="O item informado não é uma variação de alteração"), 400
+                return jsonify(status="erro", mensagem="Item não encontrado"), 404
 
-            id_pai = var.get("id_origem")
-            pai_lock = None
-
-            # 2) tenta ler o pai direto
-            if id_pai:
-                cur.execute("""
-                    SELECT id_template, em_uso, em_uso_modo, em_uso_por
-                      FROM galeria_juridico
-                     WHERE id_template = %s
-                """, (id_pai,))
-                pai_lock = cur.fetchone()
-
-            # 3) fallback: pai já foi removido – tenta achar o "principal" atual compatível
-            if not pai_lock:
-                cur.execute("""
-                    SELECT id_template, em_uso, em_uso_modo, em_uso_por
-                      FROM galeria_juridico
-                     WHERE nome_arquivo = %s
-                       AND caminho      = %s
-                       AND type         = %s
-                       AND COALESCE(status,'') NOT IN ('baixado','alterado')
-                     ORDER BY id_template DESC
-                     LIMIT 1
-                """, (var["nome_arquivo"], var["caminho"], var["type"]))
-                pai_lock = cur.fetchone()
-                id_pai = pai_lock["id_template"] if pai_lock else None
-
-            # 4) bloqueio só se alguém estiver EDITANDO um possível pai atual
-            if pai_lock and pai_lock.get("em_uso") and (pai_lock.get("em_uso_modo") or "edicao") == "edicao":
-                if str(pai_lock.get("em_uso_por") or "") != str(usuario_req or ""):
-                    return jsonify(status="erro", mensagem="Template pai em edição por outro usuário"), 409
-
+            st = (var.get("status") or "").lower()
+            alt = (var.get("alteracao") or "").lower()
+            tipo = (var.get("type") or "").lower()
+            caminho = var.get("caminho") or "/"
+            nome_atual = var.get("nome_arquivo") or ""
             agora = marca_agora()
 
-            # 5) promove variação
-            cur.execute("""
-                UPDATE galeria_juridico
-                   SET status = '',
-                       alteracao = NULL,
-                       id_origem = NULL,
-                       em_uso = FALSE,
-                       em_uso_modo = NULL,
-                       em_uso_por = NULL,
-                       data_alteracao = %s
-                 WHERE id_template = %s
-            """, (agora, id_alt,))
+            # ===== CASO A: VARIAÇÃO DE CONTEÚDO (promover) =====
+            if st == "alterado" and alt == "alterado":
+                id_pai = var.get("id_origem")
+                pai_lock = None
 
-            # 6) remove pai (se houver)
-            if id_pai:
-                cur.execute("DELETE FROM galeria_juridico WHERE id_template = %s", (id_pai,))
+                # tenta ler o pai direto
+                if id_pai:
+                    cur.execute("""
+                        SELECT id_template, em_uso, em_uso_modo, em_uso_por
+                          FROM galeria_juridico
+                         WHERE id_template = %s
+                    """, (id_pai,))
+                    pai_lock = cur.fetchone()
 
-            cnx.commit()
+                # fallback: pai já foi removido – tenta achar o "principal" atual compatível
+                if not pai_lock:
+                    cur.execute("""
+                        SELECT id_template, em_uso, em_uso_modo, em_uso_por
+                          FROM galeria_juridico
+                         WHERE nome_arquivo = %s
+                           AND caminho      = %s
+                           AND type         = %s
+                           AND COALESCE(status,'') NOT IN ('baixado','alterado')
+                         ORDER BY id_template DESC
+                         LIMIT 1
+                    """, (nome_atual, caminho, var["type"]))
+                    pai_lock = cur.fetchone()
+                    id_pai = pai_lock["id_template"] if pai_lock else None
 
-        return jsonify(
-            status="sucesso",
-            mensagem="Variação promovida e template original removido.",
-            id_promovido=id_alt
-        )
+                # bloqueia se um possível pai estiver em edição por OUTRO usuário
+                if pai_lock and pai_lock.get("em_uso") and (pai_lock.get("em_uso_modo") or "edicao") == "edicao":
+                    if str(pai_lock.get("em_uso_por") or "") != str(usuario_req or ""):
+                        return jsonify(status="erro", mensagem="Template pai em edição por outro usuário"), 409
+
+                # promove variação
+                cur.execute("""
+                    UPDATE galeria_juridico
+                       SET status = '',
+                           alteracao = NULL,
+                           id_origem = NULL,
+                           em_uso = FALSE,
+                           em_uso_modo = NULL,
+                           em_uso_por = NULL,
+                           data_alteracao = %s
+                     WHERE id_template = %s
+                """, (agora, id_alt,))
+
+                # remove o pai (se houver)
+                if id_pai:
+                    cur.execute("DELETE FROM galeria_juridico WHERE id_template = %s", (id_pai,))
+
+                cnx.commit()
+                return jsonify(
+                    status="sucesso",
+                    mensagem="Variação promovida e template original removido.",
+                    id_promovido=id_alt
+                )
+
+            # ===== CASO B: RESTAURAR DELETADO (lixeira) =====
+            is_deletado = (st == "deletado") or (st == "alterado" and alt == "deletado")
+            if is_deletado:
+                # Pasta: restaura a pasta e todos os filhos marcados como deletados
+                if tipo == "pasta":
+                    old_abs = f"{caminho}{nome_atual}/"
+                    # Garante nome único para a pasta a restaurar
+                    nome_final = nome_unico(cnx, caminho, nome_atual)
+                    new_abs = f"{caminho}{nome_final}/"
+
+                    if nome_final != nome_atual:
+                        # Renomeia a pasta restaurada e ajusta o caminho dos filhos
+                        cur.execute("""
+                            UPDATE galeria_juridico
+                               SET nome_arquivo   = %s,
+                                   status         = '',
+                                   alteracao      = NULL,
+                                   em_uso         = FALSE,
+                                   em_uso_modo    = NULL,
+                                   em_uso_por     = NULL,
+                                   data_alteracao = %s
+                             WHERE id_template    = %s
+                        """, (nome_final, agora, id_alt))
+
+                        cur.execute("""
+                            UPDATE galeria_juridico
+                               SET caminho        = REPLACE(caminho, %s, %s),
+                                   status         = '',
+                                   alteracao      = NULL,
+                                   em_uso         = FALSE,
+                                   em_uso_modo    = NULL,
+                                   em_uso_por     = NULL,
+                                   data_alteracao = %s
+                             WHERE caminho LIKE %s
+                        """, (old_abs, new_abs, agora, f"{old_abs}%"))
+                    else:
+                        # Sem conflito: apenas restaura pasta e filhos
+                        cur.execute("""
+                            UPDATE galeria_juridico
+                               SET status         = '',
+                                   alteracao      = NULL,
+                                   em_uso         = FALSE,
+                                   em_uso_modo    = NULL,
+                                   em_uso_por     = NULL,
+                                   data_alteracao = %s
+                             WHERE id_template    = %s
+                        """, (agora, id_alt))
+
+                        cur.execute("""
+                            UPDATE galeria_juridico
+                               SET status         = '',
+                                   alteracao      = NULL,
+                                   em_uso         = FALSE,
+                                   em_uso_modo    = NULL,
+                                   em_uso_por     = NULL,
+                                   data_alteracao = %s
+                             WHERE caminho LIKE %s
+                        """, (agora, f"{old_abs}%"))
+
+                    cnx.commit()
+                    return jsonify(
+                        status="sucesso",
+                        mensagem="Pasta e itens restaurados com sucesso.",
+                        id_restaurado=id_alt,
+                        id_promovido=id_alt,  # compat
+                        nome=nome_final
+                    )
+
+                # Arquivo (template/individual): restaura garantindo nome único
+                nome_final = nome_unico(cnx, caminho, nome_atual)
+                if nome_final != nome_atual:
+                    cur.execute("""
+                        UPDATE galeria_juridico
+                           SET nome_arquivo   = %s,
+                               status         = '',
+                               alteracao      = NULL,
+                               em_uso         = FALSE,
+                               em_uso_modo    = NULL,
+                               em_uso_por     = NULL,
+                               data_alteracao = %s
+                         WHERE id_template    = %s
+                    """, (nome_final, agora, id_alt))
+                    msg = "Item restaurado com sucesso (renomeado para evitar conflito)."
+                else:
+                    cur.execute("""
+                        UPDATE galeria_juridico
+                           SET status         = '',
+                               alteracao      = NULL,
+                               em_uso         = FALSE,
+                               em_uso_modo    = NULL,
+                               em_uso_por     = NULL,
+                               data_alteracao = %s
+                         WHERE id_template    = %s
+                    """, (agora, id_alt))
+                    msg = "Item restaurado com sucesso."
+
+                cnx.commit()
+                return jsonify(
+                    status="sucesso",
+                    mensagem=msg,
+                    id_restaurado=id_alt,
+                    id_promovido=id_alt,  # compat
+                    nome=nome_final
+                )
+
+            # Nenhum dos casos suportados
+            return jsonify(
+                status="erro",
+                mensagem="O item informado não é uma variação de alteração nem um item deletado."
+            ), 400
+
     except Exception:
         logger.exception("/reverter_alteracao: falha")
-        return jsonify(status="erro", mensagem="Falha ao reverter alteração"), 500
+        return jsonify(status="erro", mensagem="Falha ao reverter"), 500
 
 @app.route("/renomear", methods=["POST"])
 def renomear():
