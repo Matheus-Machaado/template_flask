@@ -344,8 +344,8 @@ def process_paragraph(para, image_map, plain_text_ref):
                     break
             try:
                 ns = run.element.nsmap
-                br_qtd = len(run.element.xpath('.//w:br', namespaces=ns))
                 tab_qtd = len(run.element.xpath('.//w:tab', namespaces=ns))
+                br_qtd  = len(run.element.xpath('.//w:br | .//w:cr', namespaces=ns))
                 if tab_qtd:
                     p_html += '&emsp;' * tab_qtd
                 if br_qtd:
@@ -392,7 +392,7 @@ def process_paragraph(para, image_map, plain_text_ref):
         try:
             ns = run.element.nsmap
             tab_qtd = len(run.element.xpath('.//w:tab', namespaces=ns))
-            br_qtd  = len(run.element.xpath('.//w:br',  namespaces=ns))
+            br_qtd  = len(run.element.xpath('.//w:br | .//w:cr', namespaces=ns))
             if tab_qtd:
                 p_html += '&emsp;' * tab_qtd
             if br_qtd:
@@ -502,7 +502,9 @@ def apply_text_formatting(text_node, run, stop_element):
     run.underline = is_underline
 
 def convert_html_to_docx(html_content):
-    """Converte HTML (com estilos inline) em um arquivo DOCX (BytesIO)."""
+    """Converte HTML (com estilos inline) em um arquivo DOCX (BytesIO).
+       Reconhece <hr data-docx-pagebreak="1" /> como quebra de página
+       e 'desembrulha' wrappers de UI (.page, .page-wrapper, .editor-background, #editor-content)."""
     def _pt_from_css(val):
         if not val:
             return None
@@ -549,6 +551,14 @@ def convert_html_to_docx(html_content):
             if ml is not None:
                 p_format.left_indent = Pt(ml)
 
+    def _has_break_before(el):
+        st = parse_style(el.get('style', ''))
+        return st.get('page-break-before') == 'always' or st.get('break-before') in ('page', 'always')
+
+    def _has_break_after(el):
+        st = parse_style(el.get('style', ''))
+        return st.get('page-break-after') == 'always' or st.get('break-after') in ('page', 'always')
+
     doc = Document()
 
     style = doc.styles['Normal']
@@ -576,6 +586,26 @@ def convert_html_to_docx(html_content):
     section.bottom_margin = Mm(18.52)
 
     soup = BeautifulSoup(html_content or "", "html.parser")
+
+    root = soup.body or soup
+
+    for sel in ('.page-break-line-marker', '.page-break-gutter-marker'):
+        for n in root.select(sel):
+            n.decompose()
+
+    page_divs = list(root.select('div.page'))
+    if page_divs:
+        for p in page_divs[:-1]:
+            hr = soup.new_tag('hr')
+            hr['data-docx-pagebreak'] = '1'
+            p.insert_after(hr)
+        for p in page_divs:
+            p.unwrap()
+
+    for sel in ('div.page-wrapper', 'div.editor-background', '#editor-content'):
+        for w in root.select(sel):
+            w.unwrap()
+
     body = soup.find('body') or soup
 
     def _emit_children_into_paragraph(parent_el, p_docx, stop_element):
@@ -643,7 +673,10 @@ def convert_html_to_docx(html_content):
 
                     _emit_children_into_paragraph(p_in_cell, p_docx_in_cell, p_in_cell)
 
-    for el in body.find_all(['p', 'table', 'img'], recursive=False):
+    for el in body.find_all(['p', 'table', 'img', 'hr'], recursive=False):
+        if _has_break_before(el):
+            doc.add_page_break()
+
         if el.name == 'p':
             p = doc.add_paragraph()
             pf3 = p.paragraph_format
@@ -683,6 +716,13 @@ def convert_html_to_docx(html_content):
                         run.add_picture(img_stream)
                 except Exception as e:
                     logger.warning("convert_html_to_docx: falha ao processar imagem raiz: %s", e)
+
+        elif el.name == 'hr':
+            if el.get('data-docx-pagebreak') == '1':
+                doc.add_page_break()
+
+        if _has_break_after(el):
+            doc.add_page_break()
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -765,9 +805,6 @@ def _docx_bytes_to_pdf_bytes(docx_bytes_io):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding="utf-8",
-                    creationflags=creationflags,
-                    startupinfo=startupinfo,
-                    env=env
                 )
                 if not any(name.lower().endswith(".pdf") for name in os.listdir(out_dir)):
                     raise subprocess.CalledProcessError(
@@ -881,7 +918,7 @@ def _apply_variables_to_html(raw_html, values_dict):
     def repl_plain(m):
         var_name = m.group(1)
         val = values_dict.get(var_name) if values_dict else None
-        return str(val) if (val is not None and str(val).strip() != "") else f'[{var_name}]'
+        return html.escape(str(val)) if (val is not None and str(val).strip() != "") else f'[{var_name}]'
     html_out = re.sub(r'\[([^\]]+)\]', repl_plain, html_out)
 
     return html_out
@@ -968,7 +1005,7 @@ def biblioteca_unificada():
         SELECT id_template, nome_arquivo, usuario, data_criacao, caminho, alteracao, type, status
           FROM galeria_juridico
          WHERE type IN ('template','individual')
-           AND COALESCE(status,'') NOT IN ('baixado','alterado')   -- <<<<<<<<<< ALTERAÇÃO
+           AND COALESCE(status,'') NOT IN ('baixado','alterado')
          ORDER BY id_template DESC
     """
     sql_baixados = """
@@ -1383,7 +1420,7 @@ def reverter_alteracao():
                         status="sucesso",
                         mensagem="Pasta e itens restaurados com sucesso.",
                         id_restaurado=id_alt,
-                        id_promovido=id_alt,  # compat
+                        id_promovido=id_alt,
                         nome=nome_final
                     )
 
@@ -1420,7 +1457,7 @@ def reverter_alteracao():
                     status="sucesso",
                     mensagem=msg,
                     id_restaurado=id_alt,
-                    id_promovido=id_alt,  # compat
+                    id_promovido=id_alt,
                     nome=nome_final
                 )
 
@@ -1653,7 +1690,6 @@ def reverter_download():
                 pai_lock = cur.fetchone()
 
             # 3) Fallback: se o pai não existir mais, procura um "principal" compatível
-            #    (mesmo nome/caminho/type e status que NÃO seja 'baixado' nem 'alterado')
             if not pai_lock:
                 cur.execute("""
                     SELECT id_template, em_uso, em_uso_modo, em_uso_por
@@ -1675,7 +1711,7 @@ def reverter_download():
 
             agora = marca_agora()
 
-            # 5) Promove o snapshot: torna-se o principal e limpa locks
+            # 5) Promove o snapshot
             cur.execute("""
                 UPDATE galeria_juridico
                    SET status         = '',
@@ -1780,125 +1816,125 @@ def delete_permanente():
 
 @app.route("/get_template", methods=["GET"])
 def get_template():
-	"""Abre template para edição/leitura, aplicando lock adequado e permitindo reentrância do mesmo usuário."""
-	template_id = request.args.get("id", type=int)
-	modo = (request.args.get("modo") or "edicao").strip().lower()
-	# Aceita 'usuario' OU 'id_usuario' vindos do front
-	usuario_req = (request.args.get("usuario") or request.args.get("id_usuario") or "").strip() or None
+    """Abre template para edição/leitura, aplicando lock adequado e permitindo reentrância do mesmo usuário."""
+    template_id = request.args.get("id", type=int)
+    modo = (request.args.get("modo") or "edicao").strip().lower()
+    # Aceita 'usuario' OU 'id_usuario' vindos do front
+    usuario_req = (request.args.get("usuario") or request.args.get("id_usuario") or "").strip() or None
 
-	if not template_id:
-		return jsonify(status="erro", mensagem="ID faltando")
+    if not template_id:
+        return jsonify(status="erro", mensagem="ID faltando")
 
-	try:
-		with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
-			# Lê o estado atual do lock
-			cur.execute("""
-				SELECT em_uso, em_uso_modo, em_uso_por
-				  FROM galeria_juridico
-				 WHERE id_template = %s
-			""", (template_id,))
-			lock = cur.fetchone() or {}
-			em_uso  = bool(lock.get("em_uso"))
-			em_modo = (lock.get("em_uso_modo") or "edicao")
-			em_por  = (lock.get("em_uso_por") or None)
-			same_user = (usuario_req is not None and str(em_por) == str(usuario_req))
+    try:
+        with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
+            # Lê o estado atual do lock
+            cur.execute("""
+                SELECT em_uso, em_uso_modo, em_uso_por
+                  FROM galeria_juridico
+                 WHERE id_template = %s
+            """, (template_id,))
+            lock = cur.fetchone() or {}
+            em_uso  = bool(lock.get("em_uso"))
+            em_modo = (lock.get("em_uso_modo") or "edicao")
+            em_por  = (lock.get("em_uso_por") or None)
+            same_user = (usuario_req is not None and str(em_por) == str(usuario_req))
 
-			if modo == "leitura":
-				# Se está em edição por outro usuário, bloqueia
-				if em_uso and em_modo == "edicao" and not same_user:
-					return jsonify(status="erro", mensagem="Documento já está sendo editado")
-				# Se está em edição por este mesmo usuário, apenas renova timestamp
-				if em_uso and em_modo == "edicao" and same_user:
-					cur.execute("UPDATE galeria_juridico SET data_alteracao = NOW() WHERE id_template = %s", (template_id,))
-				else:
-					# Seta lock de leitura
-					cur.execute("""
-						UPDATE galeria_juridico
-						   SET em_uso = TRUE,
-							   em_uso_modo = 'leitura',
-							   em_uso_por  = %s,
-							   data_alteracao = NOW()
-						 WHERE id_template = %s
-					""", (usuario_req, template_id))
-				cnx.commit()
-			else:
-				# modo 'edicao'
-				# Se está em edição por outro usuário, bloqueia
-				if em_uso and em_modo == "edicao" and not same_user:
-					return jsonify(status="erro", mensagem="Documento já está sendo editado")
-				# Permite reentrância do mesmo usuário e também tomar do 'leitura'
-				cur.execute("""
-					UPDATE galeria_juridico
-					   SET em_uso = TRUE,
-						   em_uso_modo = 'edicao',
-						   em_uso_por  = %s,
-						   data_alteracao = NOW()
-					 WHERE id_template = %s
-				""", (usuario_req, template_id))
-				cnx.commit()
+            if modo == "leitura":
+                # Se está em edição por outro usuário, bloqueia
+                if em_uso and em_modo == "edicao" and not same_user:
+                    return jsonify(status="erro", mensagem="Documento já está sendo editado")
+                # Se está em edição por este mesmo usuário, apenas renova timestamp
+                if em_uso and em_modo == "edicao" and same_user:
+                    cur.execute("UPDATE galeria_juridico SET data_alteracao = NOW() WHERE id_template = %s", (template_id,))
+                else:
+                    # Seta lock de leitura
+                    cur.execute("""
+                        UPDATE galeria_juridico
+                           SET em_uso = TRUE,
+                               em_uso_modo = 'leitura',
+                               em_uso_por  = %s,
+                               data_alteracao = NOW()
+                         WHERE id_template = %s
+                    """, (usuario_req, template_id))
+                cnx.commit()
+            else:
+                # modo 'edicao'
+                # Se está em edição por outro usuário, bloqueia
+                if em_uso and em_modo == "edicao" and not same_user:
+                    return jsonify(status="erro", mensagem="Documento já está sendo editado")
+                # Permite reentrância do mesmo usuário e também tomar do 'leitura'
+                cur.execute("""
+                    UPDATE galeria_juridico
+                       SET em_uso = TRUE,
+                           em_uso_modo = 'edicao',
+                           em_uso_por  = %s,
+                           data_alteracao = NOW()
+                     WHERE id_template = %s
+                """, (usuario_req, template_id))
+                cnx.commit()
 
-			# Carrega conteúdo do template
-			cur.execute("""
-				SELECT nome_arquivo, template, template_html, type, data_alteracao, variaveis_valores
-				  FROM galeria_juridico
-				 WHERE id_template = %s
-			""", (template_id,))
-			tpl = cur.fetchone()
-			if not tpl:
-				# Reverte lock caso não exista mais
-				executar("UPDATE galeria_juridico SET em_uso = FALSE, em_uso_modo=NULL, em_uso_por=NULL WHERE id_template = %s", (template_id,))
-				return jsonify(status="erro", mensagem="Template não encontrado")
+            # Carrega conteúdo do template
+            cur.execute("""
+                SELECT nome_arquivo, template, template_html, type, data_alteracao, variaveis_valores
+                  FROM galeria_juridico
+                 WHERE id_template = %s
+            """, (template_id,))
+            tpl = cur.fetchone()
+            if not tpl:
+                # Reverte lock caso não exista mais
+                executar("UPDATE galeria_juridico SET em_uso = FALSE, em_uso_modo=NULL, em_uso_por=NULL WHERE id_template = %s", (template_id,))
+                return jsonify(status="erro", mensagem="Template não encontrado")
 
-			if not tpl["template_html"]:
-				html_conv = docx_to_html(tpl["template"])
-				cur.execute(
-					"UPDATE galeria_juridico SET template_html = %s, data_alteracao = NOW() WHERE id_template = %s",
-					(html_conv, template_id))
-				cnx.commit()
-				tpl["template_html"] = html_conv
+            if not tpl["template_html"]:
+                html_conv = docx_to_html(tpl["template"])
+                cur.execute(
+                    "UPDATE galeria_juridico SET template_html = %s, data_alteracao = NOW() WHERE id_template = %s",
+                    (html_conv, template_id))
+                cnx.commit()
+                tpl["template_html"] = html_conv
 
-			try:
-				componentes = json.loads(tpl["template_html"])
-				assert isinstance(componentes, list)
-			except Exception:
-				componentes = [{"nome_arquivo": tpl["nome_arquivo"], "template_html": tpl["template_html"]}]
+            try:
+                componentes = json.loads(tpl["template_html"])
+                assert isinstance(componentes, list)
+            except Exception:
+                componentes = [{"nome_arquivo": tpl["nome_arquivo"], "template_html": tpl["template_html"]}]
 
-			valores_salvos = []
-			if tpl.get("variaveis_valores"):
-				try:
-					valores_salvos = json.loads(tpl["variaveis_valores"])
-				except Exception:
-					valores_salvos = []
+            valores_salvos = []
+            if tpl.get("variaveis_valores"):
+                try:
+                    valores_salvos = json.loads(tpl["variaveis_valores"])
+                except Exception:
+                    valores_salvos = []
 
-			variaveis_encontradas = set()
-			for comp in componentes:
-				soup = BeautifulSoup(comp["template_html"], 'html.parser')
-				texto_puro = soup.get_text()
-				matches = re.findall(r'\[([^\]]+)\]', texto_puro)
-				for v in matches:
-					variaveis_encontradas.add(v)
+            variaveis_encontradas = set()
+            for comp in componentes:
+                soup = BeautifulSoup(comp["template_html"], 'html.parser')
+                texto_puro = soup.get_text()
+                matches = re.findall(r'\[([^\]]+)\]', texto_puro)
+                for v in matches:
+                    variaveis_encontradas.add(v)
 
-			variaveis = list(variaveis_encontradas)
-			hora_iso = tpl["data_alteracao"].isoformat(sep=" ", timespec="seconds") if tpl["data_alteracao"] else marca_agora()
+            variaveis = list(variaveis_encontradas)
+            hora_iso = tpl["data_alteracao"].isoformat(sep=" ", timespec="seconds") if tpl["data_alteracao"] else marca_agora()
 
-		return jsonify(
-			status="sucesso",
-			mensagem="Template aberto com sucesso.",
-			nome_arquivo=tpl["nome_arquivo"],
-			tipo=tpl["type"],
-			hora_servidor=hora_iso,
-			componentes=componentes,
-			variaveis=variaveis,
-			variaveis_valores=valores_salvos,
-			total_variaveis=len(variaveis)
-		)
-	except Exception as exc:
-		try:
-			executar("UPDATE galeria_juridico SET em_uso = FALSE, em_uso_modo=NULL, em_uso_por=NULL WHERE id_template = %s", (template_id,))
-		except Exception:
-			pass
-		logger.exception("/get_template: falha ao abrir template")
-		return jsonify(status="erro", mensagem=str(exc))
+        return jsonify(
+            status="sucesso",
+            mensagem="Template aberto com sucesso.",
+            nome_arquivo=tpl["nome_arquivo"],
+            tipo=tpl["type"],
+            hora_servidor=hora_iso,
+            componentes=componentes,
+            variaveis=variaveis,
+            variaveis_valores=valores_salvos,
+            total_variaveis=len(variaveis)
+        )
+    except Exception as exc:
+        try:
+            executar("UPDATE galeria_juridico SET em_uso = FALSE, em_uso_modo=NULL, em_uso_por=NULL WHERE id_template = %s", (template_id,))
+        except Exception:
+            pass
+        logger.exception("/get_template: falha ao abrir template")
+        return jsonify(status="erro", mensagem=str(exc))
 
 @app.route("/listar_variaveis", methods=["GET"])
 def listar_variaveis():
@@ -2251,28 +2287,64 @@ def inserir_componentes():
         logger.exception("/inserir_componentes: falha ao inserir")
         return jsonify(status="erro", mensagem="Falha ao inserir componentes"), 500
 
-@app.route("/download_word", methods=["GET"])
-def download_word():
-    """Gera e baixa o DOCX final, aplicando variáveis salvas no template."""
-    template_id = request.args.get("id", type=int)
-    if not template_id:
-        return jsonify(status="erro", mensagem="ID faltando"), 400
-    try:
-        htmls, vals, nome = _load_componentes_e_variaveis(template_id)
-        if htmls is None:
-            return jsonify(status="erro", mensagem="Template não encontrado"), 404
-        html_fusao = _merge_componentes_com_variaveis(htmls, vals)
-        docx_io = convert_html_to_docx(html_fusao)
-        download_name = _safe_filename(nome, "docx")
-        return send_file(
-            docx_io,
-            as_attachment=True,
-            download_name=download_name,
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-    except Exception:
-        logger.exception("/download_word: falha ao gerar DOCX")
-        return jsonify(status="erro", mensagem="Falha ao gerar documento"), 500
+@app.route("/download_docx", methods=["GET", "POST"])
+def download_docx():
+	"""Gera DOCX.
+	GET: igual antes (usa banco pelo id=?).
+	POST: recebe HTML materializado (pages_html/html) e aplica variáveis."""
+	if request.method == "POST":
+		data = request.get_json(silent=True) or {}
+
+		pages = data.get("pages_html") or []
+		raw_html = data.get("html")
+		vals_list = data.get("vars") or []
+		nome = (data.get("nome_arquivo") or "documento")
+
+		# Vars para substituição (compatível com _apply_variables_to_html)
+		vals = {}
+		for it in vals_list:
+			n = (it or {}).get("nome")
+			v = (it or {}).get("valor")
+			if n:
+				vals[n] = v
+
+		if pages:
+			merged = "<hr data-docx-pagebreak='1'>".join(pages)
+		elif raw_html:
+			merged = raw_html
+		else:
+			return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
+
+		html_final = _apply_variables_to_html(merged, vals)
+		docx_io = convert_html_to_docx(html_final)
+		download_name = _safe_filename(nome, "docx")
+		return send_file(
+			docx_io,
+			as_attachment=True,
+			download_name=download_name,
+			mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		)
+
+	# GET (comportamento preservado)
+	template_id = request.args.get("id", type=int)
+	if not template_id:
+		return jsonify(status="erro", mensagem="ID faltando"), 400
+	try:
+		htmls, vals, nome = _load_componentes_e_variaveis(template_id)
+		if htmls is None:
+			return jsonify(status="erro", mensagem="Template não encontrado"), 404
+		html_fusao = _merge_componentes_com_variaveis(htmls, vals)
+		docx_io = convert_html_to_docx(html_fusao)
+		download_name = _safe_filename(nome, "docx")
+		return send_file(
+			docx_io,
+			as_attachment=True,
+			download_name=download_name,
+			mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		)
+	except Exception:
+		logger.exception("/download_word: falha ao gerar DOCX")
+		return jsonify(status="erro", mensagem="Falha ao gerar documento"), 500
 
 @app.route("/unlock_template", methods=["POST"])
 def unlock_template():
@@ -2324,312 +2396,79 @@ def refresh_lock():
         logger.exception("/refresh_lock: falha ao atualizar lock")
         return jsonify(status="erro", mensagem="Falha ao atualizar lock"), 500
 
-@app.route("/download_pdf", methods=["GET"])
+@app.route("/download_pdf", methods=["GET", "POST"])
 def download_pdf():
-    """Gera e baixa o PDF final (conversão via LibreOffice/docx2pdf)."""
-    template_id = request.args.get("id", type=int)
-    if not template_id:
-        return jsonify(status="erro", mensagem="ID faltando"), 400
-    try:
-        htmls, vals, nome = _load_componentes_e_variaveis(template_id)
-        if htmls is None:
-            return jsonify(status="erro", mensagem="Template não encontrado"), 404
-        html_fusao = _merge_componentes_com_variaveis(htmls, vals)
-        docx_io = convert_html_to_docx(html_fusao)
-        pdf_io = _docx_bytes_to_pdf_bytes(docx_io)
-        download_name = _safe_filename(nome, "pdf")
-        return send_file(
-            pdf_io,
-            as_attachment=True,
-            download_name=download_name,
-            mimetype="application/pdf"
-        )
-    except Exception as e:
-        print(e)
-        logger.exception("/download_pdf: falha ao gerar PDF")
-        return jsonify(status="erro", mensagem="Falha ao gerar PDF"), 500
+	"""Gera PDF.
+	GET: igual antes (usa banco pelo id=?).
+	POST: recebe HTML materializado (pages_html/html) e aplica variáveis."""
+	if request.method == "POST":
+		data = request.get_json(silent=True) or {}
 
-@app.route("/linhas_pdf", methods=["POST"])
-def linhas_pdf():
-    """Gera 'âncoras' (primeira/última linha) por página do PDF total e por componente."""
-    data = request.get_json(force=True) or {}
+		pages = data.get("pages_html") or []
+		raw_html = data.get("html")
+		vals_list = data.get("vars") or []
+		nome = (data.get("nome_arquivo") or "documento")
 
-    def _to_int(v):
-        try:
-            return int(str(v).strip())
-        except Exception:
-            return None
+		vals = {}
+		for it in vals_list:
+			n = (it or {}).get("nome")
+			v = (it or {}).get("valor")
+			if n:
+				vals[n] = v
 
-    def _is_nonempty_str(s):
-        return isinstance(s, str) and s.strip() != ""
+		if pages:
+			merged = "<hr data-docx-pagebreak='1'>".join(pages)
+		elif raw_html:
+			merged = raw_html
+		else:
+			return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
 
-    VAR_PATTERN = re.compile(r"\[([^\]\[]+)\]")
+		html_final = _apply_variables_to_html(merged, vals)
+		docx_io = convert_html_to_docx(html_final)
+		pdf_io = _docx_bytes_to_pdf_bytes(docx_io)
+		download_name = _safe_filename(nome, "pdf")
+		return send_file(
+			pdf_io,
+			as_attachment=True,
+			download_name=download_name,
+			mimetype="application/pdf"
+		)
 
-    def _vals_list_to_dict(lst):
-        vals = {}
-        if isinstance(lst, list):
-            for it in lst:
-                try:
-                    n, v = it.get("nome"), it.get("valor")
-                    if _is_nonempty_str(n) and v is not None:
-                        vals[n] = str(v)
-                except Exception:
-                    pass
-        return vals
-
-    def _apply_vars(html_src, vals_dict):
-        if not _is_nonempty_str(html_src):
-            return ""
-        def repl(m):
-            k = m.group(1)
-            val = vals_dict.get(k)
-            return str(val) if _is_nonempty_str(val) else f"[{k}]"
-        return VAR_PATTERN.sub(repl, html_src)
-
-    def _wrap_html(body):
-        return "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>" + body + "</body></html>"
-
-    def _pdf_pages_from_html(body_html):
-        docx_io = convert_html_to_docx(body_html)
-        pdf_io  = _docx_bytes_to_pdf_bytes(docx_io)
-        pages   = _extract_pages_text_from_pdf(pdf_io, normalizar=True, manter_quebras=True)
-        return pages
-
-    def _first_last_lines(pages_text):
-        first_lines, last_lines = [], []
-        for ptxt in pages_text:
-            raw_lines = [(ln or "").strip() for ln in (ptxt or "").splitlines()]
-            lines = [ln for ln in raw_lines if ln]
-            if not lines:
-                first_lines.append("")
-                last_lines.append("")
-                continue
-            def pick_first(ls):
-                for s in ls:
-                    if not s.isdigit():
-                        return s
-                return ls[0]
-            def pick_last(ls):
-                for s in reversed(ls):
-                    if not s.isdigit():
-                        return s
-                return ls[-1]
-            first_lines.append(pick_first(lines))
-            last_lines.append(pick_last(lines))
-        return first_lines, last_lines
-
-    template_id = _to_int(data.get("id_template"))
-    if not template_id:
-        return jsonify(status="erro", mensagem="id_template faltando"), 400
-
-    try:
-        with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
-            cur.execute("""
-                SELECT nome_arquivo, template_html, variaveis_valores
-                  FROM galeria_juridico
-                 WHERE id_template = %s
-            """, (template_id,))
-            row = cur.fetchone()
-            if not row:
-                return jsonify(status="erro", mensagem="Template não encontrado"), 404
-
-        try:
-            comps_raw = json.loads(row["template_html"] or "[]")
-            if not isinstance(comps_raw, list):
-                comps_raw = [{"nome_arquivo": row["nome_arquivo"], "template_html": row["template_html"] or ""}]
-        except Exception:
-            comps_raw = [{"nome_arquivo": row["nome_arquivo"], "template_html": row["template_html"] or ""}]
-
-        vals_db = []
-        if row.get("variaveis_valores"):
-            try:
-                vals_db = json.loads(row["variaveis_valores"])
-            except Exception:
-                vals_db = []
-        vals = _vals_list_to_dict(vals_db)
-
-        if not comps_raw:
-            return jsonify(status="erro", mensagem="Template sem componentes"), 400
-
-        comps_aplicados = []
-        for i, comp in enumerate(comps_raw):
-            nome = comp.get("nome_arquivo") or f"Componente {i}"
-            html_comp = comp.get("template_html") or ""
-            html_ok = _apply_vars(html_comp, vals)
-            comps_aplicados.append({"indice": i, "nome_arquivo": nome, "html": html_ok})
-
-        full_body = "".join(c["html"] for c in comps_aplicados)
-        pages_all = _pdf_pages_from_html(_wrap_html(full_body))
-        if not pages_all:
-            return jsonify(status="erro", mensagem="PDF não retornou páginas"), 500
-
-        first_all, last_all = _first_last_lines(pages_all)
-
-        componentes_out = []
-        prev_until = 0
-        for comp in comps_aplicados:
-            i = comp["indice"]
-            until_body = "".join(c["html"] for c in comps_aplicados[:i+1])
-            pages_until = _pdf_pages_from_html(_wrap_html(until_body))
-            start = prev_until
-            end   = len(pages_until)
-            prev_until = end
-            first_slice = first_all[start:end]
-            last_slice  = last_all[start:end]
-            componentes_out.append({
-                "indice": i,
-                "nome_arquivo": comp["nome_arquivo"],
-                "page_range": {"start": start, "end": end},
-                "first_lines": first_slice,
-                "last_lines": last_slice
-            })
-
-        return jsonify(
-            status="sucesso",
-            mensagem="Âncoras do PDF geradas com sucesso.",
-            nome_arquivo=(row.get("nome_arquivo") if isinstance(row, dict) else None),
-            total_paginas=len(pages_all),
-            anchors_full={"first_lines": first_all, "last_lines": last_all},
-            componentes=componentes_out
-        )
-    except Exception:
-        logger.exception("/linhas_pdf: falha ao gerar âncoras")
-        return jsonify(status="erro", mensagem="Falha ao gerar informações do PDF"), 500
-
-@app.route("/transferir_variaveis", methods=["POST"])
-def transferir_variaveis():
-    """Transfere valores de variáveis do documento origem para destino, persistindo interseção."""
-    try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return jsonify(status="erro", mensagem="JSON inválido"), 400
-
-    id_origem  = data.get("id_origem")
-    id_destino = data.get("id_destino")
-    lista_vals = data.get("variaveis_valores")
-
-    try:
-        id_destino = int(id_destino)
-    except Exception:
-        return jsonify(status="erro", mensagem="id_destino inválido"), 400
-
-    VAR_RE = re.compile(r'\[([^\]]+)\]')
-
-    def extract_vars_from_template_html(template_html_raw):
-        nomes = set()
-        try:
-            maybe_list = json.loads(template_html_raw or "[]")
-            if isinstance(maybe_list, list):
-                comps = maybe_list
-            else:
-                comps = [{"template_html": template_html_raw or ""}]
-        except Exception:
-            comps = [{"template_html": template_html_raw or ""}]
-        for comp in comps:
-            html_comp = comp.get("template_html") or ""
-            soup = BeautifulSoup(html_comp, "html.parser")
-            texto = soup.get_text(" ", strip=False)
-            for v in VAR_RE.findall(texto or ""):
-                if v:
-                    nomes.add(v)
-            for v in VAR_RE.findall(html_comp):
-                if v:
-                    nomes.add(v)
-        return nomes
-
-    def list_to_dict(vals_list):
-        d = {}
-        if isinstance(vals_list, list):
-            for it in vals_list:
-                try:
-                    nome = it.get("nome")
-                    val  = it.get("valor")
-                    if isinstance(nome, str) and nome.strip() != "":
-                        d[nome] = ("" if val is None else str(val))
-                except Exception:
-                    pass
-        return d
-
-    agora = marca_agora()
-    try:
-        with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
-            cur.execute("""
-                SELECT id_template, template_html, variaveis_valores
-                  FROM galeria_juridico
-                 WHERE id_template = %s
-                   AND type IN ('template','individual')
-            """, (id_destino,))
-            dest = cur.fetchone()
-            if not dest:
-                return jsonify(status="erro", mensagem="Destino não encontrado"), 404
-
-            vars_dest = extract_vars_from_template_html(dest.get("template_html"))
-
-            dest_vals_dict = {}
-            if dest.get("variaveis_valores"):
-                try:
-                    dest_vals_dict = list_to_dict(json.loads(dest["variaveis_valores"]))
-                except Exception:
-                    dest_vals_dict = {}
-
-            if not lista_vals and id_origem:
-                try:
-                    id_origem = int(id_origem)
-                except Exception:
-                    id_origem = None
-                if id_origem:
-                    cur.execute("""
-                        SELECT variaveis_valores
-                          FROM galeria_juridico
-                         WHERE id_template = %s
-                           AND type IN ('template','individual')
-                    """, (id_origem,))
-                    orig = cur.fetchone()
-                    if orig and orig.get("variaveis_valores"):
-                        try:
-                            lista_vals = json.loads(orig["variaveis_valores"])
-                        except Exception:
-                            lista_vals = None
-
-            input_vals_dict = list_to_dict(lista_vals) if lista_vals else {}
-
-            intersec_dict = {n: v for n, v in input_vals_dict.items() if n in vars_dest}
-
-            merged = {**dest_vals_dict, **intersec_dict}
-            merged = {n: merged[n] for n in merged.keys() if n in vars_dest}
-            merged_list = [{"nome": n, "valor": merged[n]} for n in sorted(merged.keys())]
-
-            cur.execute("""
-                UPDATE galeria_juridico
-                   SET variaveis_valores = %s,
-                       data_alteracao    = %s
-                 WHERE id_template = %s
-            """, (json.dumps(merged_list, ensure_ascii=False), agora, id_destino))
-            cnx.commit()
-
-        return jsonify(
-            status="sucesso",
-            mensagem="Valores de variáveis transferidos com sucesso.",
-            destino=id_destino,
-            total_destino=len(vars_dest),
-            atualizadas=len(intersec_dict),
-            data_alteracao=agora
-        )
-    except Exception:
-        logger.exception("/transferir_variaveis: falha ao transferir")
-        return jsonify(status="erro", mensagem="Falha ao transferir variáveis"), 500
+	# GET (comportamento preservado)
+	template_id = request.args.get("id", type=int)
+	if not template_id:
+		return jsonify(status="erro", mensagem="ID faltando"), 400
+	try:
+		htmls, vals, nome = _load_componentes_e_variaveis(template_id)
+		if htmls is None:
+			return jsonify(status="erro", mensagem="Template não encontrado"), 404
+		html_fusao = _merge_componentes_com_variaveis(htmls, vals)
+		docx_io = convert_html_to_docx(html_fusao)
+		pdf_io = _docx_bytes_to_pdf_bytes(docx_io)
+		download_name = _safe_filename(nome, "pdf")
+		return send_file(
+			pdf_io,
+			as_attachment=True,
+			download_name=download_name,
+			mimetype="application/pdf"
+		)
+	except Exception:
+		logger.exception("/download_pdf: falha ao gerar PDF")
+		return jsonify(status="erro", mensagem="Falha ao gerar PDF"), 500
 
 @app.route("/download_componentes_zip", methods=["POST"])
 def download_componentes_zip():
 	"""
-	Gera um ZIP contendo cada componente exportado individualmente
-	no formato solicitado (DOCX ou PDF).
-
-	Payload (JSON):
+	POST JSON:
 	{
 		"id_template": 123,
-		"formato": "pdf" | "docx",
-		"indices": [0,2,3]   # opcional; se ausente/ vazio => todos
+		"formato": "pdf"|"docx",
+		"indices": [0,2,3],               # opcional; vazio => todos
+		"overrides_html": {               # opcional
+			"0": {"html": "<p>..</p>", "nome": "Capa"},
+			"3": {"html": "...",        "nome": "Anexo"}
+		},
+		"vars": [{"nome":"X","valor":"Y"}] # opcional
 	}
 	"""
 	try:
@@ -2640,11 +2479,21 @@ def download_componentes_zip():
 	template_id = data.get("id_template")
 	formato = (data.get("formato") or "pdf").strip().lower()
 	indices = data.get("indices") or []
+	overrides = data.get("overrides_html") or {}
+	vals_list = data.get("vars") or []
 
 	if not template_id:
 		return jsonify(status="erro", mensagem="id_template faltando"), 400
 	if formato not in ("pdf", "docx"):
 		return jsonify(status="erro", mensagem="Formato inválido"), 400
+
+	# Vars para substituição
+	vals = {}
+	for it in vals_list:
+		n = (it or {}).get("nome")
+		v = (it or {}).get("valor")
+		if n:
+			vals[n] = v
 
 	try:
 		with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
@@ -2664,21 +2513,10 @@ def download_componentes_zip():
 		except Exception:
 			comps_json = [{"nome_arquivo": row["nome_arquivo"], "template_html": row["template_html"] or ""}]
 
-		vals = {}
-		if row.get("variaveis_valores"):
-			try:
-				for it in json.loads(row["variaveis_valores"]):
-					n, v = it.get("nome"), it.get("valor")
-					if n:
-						vals[n] = v
-			except Exception:
-				pass
-
 		total = len(comps_json)
 		if not total:
 			return jsonify(status="erro", mensagem="Template sem componentes"), 400
 
-		# ✅ sem indices => todos
 		if not indices:
 			sel = list(range(total))
 		else:
@@ -2694,11 +2532,19 @@ def download_componentes_zip():
 		with zipfile.ZipFile(out_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
 			for i in sel:
 				comp = comps_json[i]
-				nome_comp = comp.get("nome_arquivo") or f"Componente_{i+1}"
-				html_raw  = comp.get("template_html") or ""
-				html_ok   = _apply_variables_to_html(html_raw, vals)
 
+				# Usa override se existir; senão, usa o HTML do banco
+				ov = overrides.get(str(i)) or overrides.get(i)
+				if ov and (ov.get("html") or "").strip():
+					nome_comp = ov.get("nome") or comp.get("nome_arquivo") or f"Componente_{i+1}"
+					html_raw = ov.get("html") or ""
+				else:
+					nome_comp = comp.get("nome_arquivo") or f"Componente_{i+1}"
+					html_raw = comp.get("template_html") or ""
+
+				html_ok = _apply_variables_to_html(html_raw, vals)
 				docx_io = convert_html_to_docx(html_ok)
+
 				if formato == "pdf":
 					file_io = _docx_bytes_to_pdf_bytes(docx_io)
 					ext = "pdf"
