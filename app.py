@@ -2757,6 +2757,7 @@ if __name__ == "__main__":
                 logger.exception("run_schedule: exceção ao executar tarefas agendadas")
             time.sleep(1)
 
+    print(500)
     schedule.every(10).seconds.do(unlock_stale_templates)
 
     t = threading.Thread(target=run_schedule, name="scheduler", daemon=True)
