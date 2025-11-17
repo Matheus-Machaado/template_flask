@@ -502,9 +502,7 @@ def apply_text_formatting(text_node, run, stop_element):
     run.underline = is_underline
 
 def convert_html_to_docx(html_content):
-    """Converte HTML (com estilos inline) em um arquivo DOCX (BytesIO).
-       Reconhece <hr data-docx-pagebreak="1" /> como quebra de página
-       e 'desembrulha' wrappers de UI (.page, .page-wrapper, .editor-background, #editor-content)."""
+    # --- helpers internos (iguais/compatíveis com sua versão atual) ---
     def _pt_from_css(val):
         if not val:
             return None
@@ -516,6 +514,31 @@ def convert_html_to_docx(html_content):
         if 'px' in s:
             return x * 72.0 / 96.0
         return x
+
+    def _parse_line_height(val):
+        if not val:
+            return None
+        s = str(val).strip().lower()
+        if s.endswith('%'):
+            try:
+                return ('multiple', float(s[:-1]) / 100.0)
+            except:
+                return None
+        if s.endswith('pt'):
+            try:
+                return ('exact', float(re.sub(r'[^0-9.]', '', s)))
+            except:
+                return None
+        if s.endswith('px'):
+            try:
+                px = float(re.sub(r'[^0-9.]', '', s))
+                return ('exact', px * 72.0 / 96.0)
+            except:
+                return None
+        try:
+            return ('multiple', float(s))
+        except:
+            return None
 
     def _apply_paragraph_css(p_styles, p_format, p_docx=None):
         ta = (p_styles.get('text-align') or '').strip()
@@ -551,6 +574,15 @@ def convert_html_to_docx(html_content):
             if ml is not None:
                 p_format.left_indent = Pt(ml)
 
+        lh = _parse_line_height(p_styles.get('line-height'))
+        if lh:
+            if lh[0] == 'multiple':
+                p_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+                p_format.line_spacing = lh[1]
+            else:
+                p_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+                p_format.line_spacing = Pt(lh[1])
+
     def _has_break_before(el):
         st = parse_style(el.get('style', ''))
         return st.get('page-break-before') == 'always' or st.get('break-before') in ('page', 'always')
@@ -559,16 +591,20 @@ def convert_html_to_docx(html_content):
         st = parse_style(el.get('style', ''))
         return st.get('page-break-after') == 'always' or st.get('break-after') in ('page', 'always')
 
-    doc = Document()
+    # --------- INÍCIO da função (novidades abaixo) ----------
+    # 1) Normaliza quebras duplicadas vindas do front
+    html_content = _coalesce_docx_pagebreaks(html_content or "")
 
+    # 2) Documento base e Normal style
+    doc = Document()
     style = doc.styles['Normal']
     font = style.font
-    font.name = 'Arial'
+    font.name = 'Liberation Sans'
     font.size = Pt(12)
     r = font._element
-    r.rPr.rFonts.set(qn('w:ascii'), 'Arial')
-    r.rPr.rFonts.set(qn('w:hAnsi'), 'Arial')
-    r.rPr.rFonts.set(qn('w:cs'), 'Arial')
+    r.rPr.rFonts.set(qn('w:ascii'), 'Liberation Sans')
+    r.rPr.rFonts.set(qn('w:hAnsi'), 'Liberation Sans')
+    r.rPr.rFonts.set(qn('w:cs'), 'Liberation Sans')
 
     pf = style.paragraph_format
     pf.left_indent = Pt(0)
@@ -576,23 +612,26 @@ def convert_html_to_docx(html_content):
     pf.first_line_indent = Pt(0)
     pf.space_before = Pt(0)
     pf.space_after = Pt(0)
+    pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+    pf.line_spacing = 1.2
 
     section = doc.sections[0]
-    section.page_height = Mm(297)
-    section.page_width  = Mm(210)
-    section.left_margin = Mm(18.52)
+    section.page_height  = Mm(297)
+    section.page_width   = Mm(210)
+    section.left_margin  = Mm(18.52)
     section.right_margin = Mm(18.52)
-    section.top_margin = Mm(18.52)
-    section.bottom_margin = Mm(18.52)
+    section.top_margin   = Mm(18.52)
+    section.bottom_margin= Mm(18.52)
 
-    soup = BeautifulSoup(html_content or "", "html.parser")
-
+    soup = BeautifulSoup(html_content, "html.parser")
     root = soup.body or soup
 
+    # remove marcadores visuais do editor
     for sel in ('.page-break-line-marker', '.page-break-gutter-marker'):
         for n in root.select(sel):
             n.decompose()
 
+    # converte layout com <div class="page"> em quebras
     page_divs = list(root.select('div.page'))
     if page_divs:
         for p in page_divs[:-1]:
@@ -602,6 +641,7 @@ def convert_html_to_docx(html_content):
         for p in page_divs:
             p.unwrap()
 
+    # remove wrappers conhecidos
     for sel in ('div.page-wrapper', 'div.editor-background', '#editor-content'):
         for w in root.select(sel):
             w.unwrap()
@@ -625,18 +665,15 @@ def convert_html_to_docx(html_content):
                             run.add_picture(img_stream, width=Inches(wpt / 72.0))
                         else:
                             run.add_picture(img_stream)
-                    except Exception as e:
-                        logger.warning("convert_html_to_docx: falha ao processar imagem aninhada: %s", e)
-
+                    except Exception:
+                        pass
             elif getattr(child, 'name', None) == 'br':
                 p_docx.add_run().add_break()
-
             elif isinstance(child, NavigableString):
                 s = str(child)
                 if s:
                     run = p_docx.add_run(s)
                     apply_text_formatting(child, run, stop_element)
-
             elif getattr(child, 'name', None):
                 for text_node in child.find_all(string=True, recursive=True):
                     s = str(text_node)
@@ -661,69 +698,91 @@ def convert_html_to_docx(html_content):
                 for p_in_cell in cell_html.find_all('p'):
                     p_docx_in_cell = cell_docx.add_paragraph()
                     pf2 = p_docx_in_cell.paragraph_format
-                    pf2.line_spacing_rule = WD_LINE_SPACING.SINGLE
+                    pf2.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+                    pf2.line_spacing = 1.2
                     pf2.space_before = Pt(0)
                     pf2.space_after = Pt(0)
                     pf2.first_line_indent = Pt(0)
                     _apply_paragraph_css(parse_style(p_in_cell.get('style','')), pf2, p_docx_in_cell)
-
                     txt = p_in_cell.get_text(strip=True)
                     if re.match(r'^\s*(\d+\.|[a-zA-Z][\.\)]|[IVXLCDM]+\.)', txt):
                         p_docx_in_cell.add_run('\u200b')
-
                     _emit_children_into_paragraph(p_in_cell, p_docx_in_cell, p_in_cell)
 
-    for el in body.find_all(['p', 'table', 'img', 'hr'], recursive=False):
-        if _has_break_before(el):
-            doc.add_page_break()
+    # NOVO: varredura recursiva para capturar <hr data-docx-pagebreak="1"> em QUALQUER nível
+    def _walk_blocks(container):
+        for el in getattr(container, 'children', []):
+            # ignora nós de texto soltos (opcionalmente você pode convertê-los em parágrafo)
+            if isinstance(el, NavigableString):
+                txt = str(el).strip()
+                if txt:
+                    p = doc.add_paragraph()
+                    pf3 = p.paragraph_format
+                    pf3.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+                    pf3.line_spacing = 1.2
+                    pf3.space_before = Pt(0)
+                    pf3.space_after = Pt(0)
+                    pf3.first_line_indent = Pt(0)
+                    p.add_run(txt)
+                continue
 
-        if el.name == 'p':
-            p = doc.add_paragraph()
-            pf3 = p.paragraph_format
-            pf3.line_spacing_rule = WD_LINE_SPACING.SINGLE
-            pf3.space_before = Pt(0)
-            pf3.space_after = Pt(0)
-            pf3.first_line_indent = Pt(0)
-            pf3.left_indent = Pt(0)
-            pf3.right_indent = Pt(0)
+            if not getattr(el, 'name', None):
+                continue
 
-            _apply_paragraph_css(parse_style(el.get('style','')), pf3, p)
-
-            txt = el.get_text(strip=True)
-            if re.match(r'^\s*(\d+\.|[a-zA-Z][\.\)]|[IVXLCDM]+\.)', txt):
-                p.add_run('\u200b')
-
-            _emit_children_into_paragraph(el, p, el)
-
-        elif el.name == 'table':
-            _emit_table(el)
-
-        elif el.name == 'img':
-            src = el.get('src', '')
-            if 'data:image' in src and 'base64,' in src:
-                try:
-                    img_data = src.split('base64,')[1]
-                    img_bytes = base64.b64decode(img_data)
-                    img_stream = io.BytesIO(img_bytes)
-                    p_for_img = doc.add_paragraph()
-                    p_for_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    run = p_for_img.add_run()
-                    width_css = parse_style(el.get('style','')).get('width')
-                    if width_css:
-                        wpt = _pt_from_css(width_css) or 0
-                        run.add_picture(img_stream, width=Inches(wpt / 72.0))
-                    else:
-                        run.add_picture(img_stream)
-                except Exception as e:
-                    logger.warning("convert_html_to_docx: falha ao processar imagem raiz: %s", e)
-
-        elif el.name == 'hr':
-            if el.get('data-docx-pagebreak') == '1':
+            # respeita CSS de quebra antes
+            if _has_break_before(el):
                 doc.add_page_break()
 
-        if _has_break_after(el):
-            doc.add_page_break()
+            # elementos de controle
+            if el.name == 'hr' and el.get('data-docx-pagebreak') == '1':
+                doc.add_page_break()
+            elif el.name == 'p':
+                p = doc.add_paragraph()
+                pf3 = p.paragraph_format
+                pf3.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+                pf3.line_spacing = 1.2
+                pf3.space_before = Pt(0)
+                pf3.space_after = Pt(0)
+                pf3.first_line_indent = Pt(0)
+                pf3.left_indent = Pt(0)
+                pf3.right_indent = Pt(0)
+                _apply_paragraph_css(parse_style(el.get('style','')), pf3, p)
+                txt = el.get_text(strip=True)
+                if re.match(r'^\s*(\d+\.|[a-zA-Z][\.\)]|[IVXLCDM]+\.)', txt):
+                    p.add_run('\u200b')
+                _emit_children_into_paragraph(el, p, el)
+            elif el.name == 'table':
+                _emit_table(el)
+            elif el.name == 'img':
+                src = el.get('src', '')
+                if 'data:image' in src and 'base64,' in src:
+                    try:
+                        img_data = src.split('base64,')[1]
+                        img_bytes = base64.b64decode(img_data)
+                        img_stream = io.BytesIO(img_bytes)
+                        p_for_img = doc.add_paragraph()
+                        p_for_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        run = p_for_img.add_run()
+                        width_css = parse_style(el.get('style','')).get('width')
+                        if width_css:
+                            wpt = _pt_from_css(width_css) or 0
+                            run.add_picture(img_stream, width=Inches(wpt / 72.0))
+                        else:
+                            run.add_picture(img_stream)
+                    except Exception:
+                        pass
+            else:
+                # container genérico: desce recursivamente
+                _walk_blocks(el)
 
+            # respeita CSS de quebra depois
+            if _has_break_after(el):
+                doc.add_page_break()
+
+    # Executa a varredura recursiva partindo do body
+    _walk_blocks(body)
+
+    # exporta
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -952,6 +1011,206 @@ def _extract_pages_text_from_pdf(pdf_io, normalizar=True, manter_quebras=True):
         paginas.append(txt)
     doc.close()
     return paginas
+
+def _coalesce_docx_pagebreaks(html):
+    # reduz 2+ HRs de pagebreak seguidos para 1
+    return re.sub(
+        r'(?:<hr[^>]*data-docx-pagebreak=[\'"]1[\'"][^>]*>\s*){2,}',
+        '<hr data-docx-pagebreak="1">',
+        html,
+        flags=re.I
+    )
+
+def _find_chrome():
+    env = os.environ.get("CHROME_PATH") or os.environ.get("CHROMIUM_PATH")
+    candidates = []
+    if env:
+        candidates.append(env)
+    if sys.platform.startswith("win"):
+        candidates += [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+        ]
+    else:
+        exe = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("chrome")
+        if exe:
+            candidates.append(exe)
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("chrome")
+
+def _wrap_html_for_print(body_html):
+    """
+    Empacota o HTML em páginas A4 para impressão/PDF,
+    espelhando o layout do editor (.page), mas com
+    UMA MARGEM DE SEGURANÇA MAIOR que no editor para evitar “transbordo”.
+    """
+
+    # Mesmos valores da tela, mas com um pequeno "desconto"
+    # para que o PDF tenha SEMPRE MAIS ALTURA ÚTIL que o editor.
+    PAGE_MARGIN_MM = 18.52
+    SAFETY_MM = 2.0              # tira ~2mm de margem em cada lado no PDF
+    PDF_PADDING_MM = max(0, PAGE_MARGIN_MM - SAFETY_MM)
+
+    css = f"""
+        @page {{
+            size: 210mm 297mm;
+            margin: 0;
+        }}
+
+        html, body {{
+            margin: 0;
+            padding: 0;
+        }}
+
+        body {{
+            background: #f5f8fc;
+        }}
+
+        .print-page {{
+            width: 21cm;
+            min-height: 29.7cm;
+            margin: 0 auto;
+            padding: {PDF_PADDING_MM}mm;
+            background: #ffffff;
+            box-sizing: border-box;
+
+            font-family: 'Liberation Sans', Arial, Helvetica, sans-serif;
+            font-size: 12pt;
+            line-height: 1.2;
+            color: #202124;
+
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+
+            page-break-after: always;
+            page-break-inside: avoid;
+            break-after: page;
+        }}
+
+        .print-page p,
+        .print-page h1,
+        .print-page h2,
+        .print-page h3,
+        .print-page h4,
+        .print-page h5,
+        .print-page h6,
+        .print-page ul,
+        .print-page ol,
+        .print-page table {{
+            page-break-inside: avoid;
+            break-inside: avoid-page;
+            orphans: 2;
+            widows: 2;
+        }}
+
+        .print-page p {{
+            margin: 0;
+        }}
+
+        .print-page [data-variable] {{
+            background-color: #FFF9C4;
+            padding: 1px 3px;
+            border-radius: 3px;
+            border: 1px dashed #FFD600;
+            color: #E53935;
+            font-weight: bold;
+            font-size: 10pt;
+        }}
+
+        .print-page [data-variable][data-filled="true"] {{
+            background-color: transparent;
+            border: none;
+            padding: 0;
+            color: inherit;
+            font-family: inherit;
+            font-weight: inherit;
+            font-size: inherit;
+        }}
+
+        .print-page table {{
+            border-collapse: collapse;
+            width: 100%;
+        }}
+
+        .print-page td,
+        .print-page th {{
+            box-sizing: border-box;
+        }}
+
+        .print-page img {{
+            max-width: 100%;
+            height: auto;
+        }}
+    """
+
+    raw = body_html or ""
+    soup = BeautifulSoup(raw, "html.parser")
+    root = soup.body or soup
+
+    segments = []
+    current = []
+
+    # Quebra nos <hr data-docx-pagebreak="1"> gerados pelo editor
+    for child in list(root.children):
+        if getattr(child, "name", None) == "hr" and child.get("data-docx-pagebreak") == "1":
+            html_chunk = "".join(str(el) for el in current).strip()
+            if html_chunk:
+                segments.append(html_chunk)
+            current = []
+        else:
+            current.append(child)
+
+    html_chunk = "".join(str(el) for el in current).strip()
+    if html_chunk:
+        segments.append(html_chunk)
+
+    # Sempre embrulha em .print-page para bater com o layout do editor,
+    # mas cada segmento vira UMA página física.
+    if not segments:
+        body = f'<div class="print-page">{raw}</div>'
+    else:
+        body = "".join(f'<div class="print-page">{seg}</div>' for seg in segments)
+
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<style>" + css + "</style></head><body>"
+        + body +
+        "</body></html>"
+    )
+
+def _html_to_pdf_chromium(html_input):
+    html_str = html_input or ""
+    with tempfile.TemporaryDirectory() as td:
+        html_path = os.path.join(td, "doc.html")
+        pdf_path = os.path.join(td, "doc.pdf")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_str)
+        chrome = _find_chrome()
+        if not chrome:
+            raise RuntimeError("Chrome/Chromium não encontrado")
+        cmd = [
+            chrome,
+            "--headless",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--print-to-pdf=" + pdf_path,
+            "--print-to-pdf-no-header",
+            html_path,
+        ]
+        creationflags = 0
+        startupinfo = None
+        if sys.platform.startswith("win"):
+            creationflags = 0x08000000
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", creationflags=creationflags, startupinfo=startupinfo)
+        if res.returncode != 0 or not os.path.exists(pdf_path):
+            raise RuntimeError("Falha na renderização via Chromium")
+        with open(pdf_path, "rb") as f:
+            return io.BytesIO(f.read())
 
 # === FLASK ===
 app = Flask(__name__)
@@ -2289,62 +2548,69 @@ def inserir_componentes():
 
 @app.route("/download_docx", methods=["GET", "POST"])
 def download_docx():
-	"""Gera DOCX.
-	GET: igual antes (usa banco pelo id=?).
-	POST: recebe HTML materializado (pages_html/html) e aplica variáveis."""
-	if request.method == "POST":
-		data = request.get_json(silent=True) or {}
+    """Gera DOCX.
+    GET: igual antes (usa banco pelo id=?).
+    POST: recebe HTML materializado (pages_html/html) e aplica variáveis."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
 
-		pages = data.get("pages_html") or []
-		raw_html = data.get("html")
-		vals_list = data.get("vars") or []
-		nome = (data.get("nome_arquivo") or "documento")
+        pages = data.get("pages_html") or []
+        raw_html = data.get("html")
+        vals_list = data.get("vars") or []
+        nome = (data.get("nome_arquivo") or "documento")
 
-		# Vars para substituição (compatível com _apply_variables_to_html)
-		vals = {}
-		for it in vals_list:
-			n = (it or {}).get("nome")
-			v = (it or {}).get("valor")
-			if n:
-				vals[n] = v
+        # Vars para substituição (compatível com _apply_variables_to_html)
+        vals = {}
+        for it in vals_list:
+            n = (it or {}).get("nome")
+            v = (it or {}).get("valor")
+            if n:
+                vals[n] = v
 
-		if pages:
-			merged = "<hr data-docx-pagebreak='1'>".join(pages)
-		elif raw_html:
-			merged = raw_html
-		else:
-			return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
+        if pages:
+            merged = "<hr data-docx-pagebreak='1'>".join(pages)
+        elif raw_html:
+            merged = raw_html
+        else:
+            return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
 
-		html_final = _apply_variables_to_html(merged, vals)
-		docx_io = convert_html_to_docx(html_final)
-		download_name = _safe_filename(nome, "docx")
-		return send_file(
-			docx_io,
-			as_attachment=True,
-			download_name=download_name,
-			mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-		)
+        # NOVO: coalesce das quebras de página para evitar duplicatas
+        merged = _coalesce_docx_pagebreaks(merged)
 
-	# GET (comportamento preservado)
-	template_id = request.args.get("id", type=int)
-	if not template_id:
-		return jsonify(status="erro", mensagem="ID faltando"), 400
-	try:
-		htmls, vals, nome = _load_componentes_e_variaveis(template_id)
-		if htmls is None:
-			return jsonify(status="erro", mensagem="Template não encontrado"), 404
-		html_fusao = _merge_componentes_com_variaveis(htmls, vals)
-		docx_io = convert_html_to_docx(html_fusao)
-		download_name = _safe_filename(nome, "docx")
-		return send_file(
-			docx_io,
-			as_attachment=True,
-			download_name=download_name,
-			mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-		)
-	except Exception:
-		logger.exception("/download_word: falha ao gerar DOCX")
-		return jsonify(status="erro", mensagem="Falha ao gerar documento"), 500
+        html_final = _apply_variables_to_html(merged, vals)
+        docx_io = convert_html_to_docx(html_final)
+        download_name = _safe_filename(nome, "docx")
+        return send_file(
+            docx_io,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+    # GET (comportamento preservado)
+    template_id = request.args.get("id", type=int)
+    if not template_id:
+        return jsonify(status="erro", mensagem="ID faltando"), 400
+    try:
+        htmls, vals, nome = _load_componentes_e_variaveis(template_id)
+        if htmls is None:
+            return jsonify(status="erro", mensagem="Template não encontrado"), 404
+        html_fusao = _merge_componentes_com_variaveis(htmls, vals)
+
+        # NOVO: garante normalização das quebras vindas do banco
+        html_fusao = _coalesce_docx_pagebreaks(html_fusao)
+
+        docx_io = convert_html_to_docx(html_fusao)
+        download_name = _safe_filename(nome, "docx")
+        return send_file(
+            docx_io,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+    except Exception:
+        logger.exception("/download_docx: falha ao gerar DOCX")
+        return jsonify(status="erro", mensagem="Falha ao gerar documento"), 500
 
 @app.route("/unlock_template", methods=["POST"])
 def unlock_template():
@@ -2398,174 +2664,66 @@ def refresh_lock():
 
 @app.route("/download_pdf", methods=["GET", "POST"])
 def download_pdf():
-	"""Gera PDF.
-	GET: igual antes (usa banco pelo id=?).
-	POST: recebe HTML materializado (pages_html/html) e aplica variáveis."""
-	if request.method == "POST":
-		data = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
 
-		pages = data.get("pages_html") or []
-		raw_html = data.get("html")
-		vals_list = data.get("vars") or []
-		nome = (data.get("nome_arquivo") or "documento")
+        pages = data.get("pages_html") or []
+        raw_html = data.get("html")
+        vals_list = data.get("vars") or []
+        nome = (data.get("nome_arquivo") or "documento")
 
-		vals = {}
-		for it in vals_list:
-			n = (it or {}).get("nome")
-			v = (it or {}).get("valor")
-			if n:
-				vals[n] = v
+        vals = {}
+        for it in vals_list:
+            n = (it or {}).get("nome")
+            v = (it or {}).get("valor")
+            if n:
+                vals[n] = v
 
-		if pages:
-			merged = "<hr data-docx-pagebreak='1'>".join(pages)
-		elif raw_html:
-			merged = raw_html
-		else:
-			return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
+        if pages:
+            merged = "<hr data-docx-pagebreak='1'>".join(pages)
+        elif raw_html:
+            merged = raw_html
+        else:
+            return jsonify(status="erro", mensagem="Corpo POST requer 'pages_html' ou 'html'"), 400
 
-		html_final = _apply_variables_to_html(merged, vals)
-		docx_io = convert_html_to_docx(html_final)
-		pdf_io = _docx_bytes_to_pdf_bytes(docx_io)
-		download_name = _safe_filename(nome, "pdf")
-		return send_file(
-			pdf_io,
-			as_attachment=True,
-			download_name=download_name,
-			mimetype="application/pdf"
-		)
+        merged = _coalesce_docx_pagebreaks(merged)
+        html_final = _apply_variables_to_html(merged, vals)
+        html_doc = _wrap_html_for_print(html_final)
+        try:
+            pdf_io = _html_to_pdf_chromium(html_doc)
+        except Exception as e:
+            logger.error("download_pdf chromium error: %s", e, exc_info=True)
+            return jsonify(status="erro", mensagem="Falha ao gerar PDF via Chromium"), 500
 
-	# GET (comportamento preservado)
-	template_id = request.args.get("id", type=int)
-	if not template_id:
-		return jsonify(status="erro", mensagem="ID faltando"), 400
-	try:
-		htmls, vals, nome = _load_componentes_e_variaveis(template_id)
-		if htmls is None:
-			return jsonify(status="erro", mensagem="Template não encontrado"), 404
-		html_fusao = _merge_componentes_com_variaveis(htmls, vals)
-		docx_io = convert_html_to_docx(html_fusao)
-		pdf_io = _docx_bytes_to_pdf_bytes(docx_io)
-		download_name = _safe_filename(nome, "pdf")
-		return send_file(
-			pdf_io,
-			as_attachment=True,
-			download_name=download_name,
-			mimetype="application/pdf"
-		)
-	except Exception:
-		logger.exception("/download_pdf: falha ao gerar PDF")
-		return jsonify(status="erro", mensagem="Falha ao gerar PDF"), 500
+        download_name = _safe_filename(nome, "pdf")
+        return send_file(
+            pdf_io,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/pdf"
+        )
 
-@app.route("/download_componentes_zip", methods=["POST"])
-def download_componentes_zip():
-	"""
-	POST JSON:
-	{
-		"id_template": 123,
-		"formato": "pdf"|"docx",
-		"indices": [0,2,3],               # opcional; vazio => todos
-		"overrides_html": {               # opcional
-			"0": {"html": "<p>..</p>", "nome": "Capa"},
-			"3": {"html": "...",        "nome": "Anexo"}
-		},
-		"vars": [{"nome":"X","valor":"Y"}] # opcional
-	}
-	"""
-	try:
-		data = request.get_json(force=True) or {}
-	except Exception:
-		return jsonify(status="erro", mensagem="JSON inválido"), 400
-
-	template_id = data.get("id_template")
-	formato = (data.get("formato") or "pdf").strip().lower()
-	indices = data.get("indices") or []
-	overrides = data.get("overrides_html") or {}
-	vals_list = data.get("vars") or []
-
-	if not template_id:
-		return jsonify(status="erro", mensagem="id_template faltando"), 400
-	if formato not in ("pdf", "docx"):
-		return jsonify(status="erro", mensagem="Formato inválido"), 400
-
-	# Vars para substituição
-	vals = {}
-	for it in vals_list:
-		n = (it or {}).get("nome")
-		v = (it or {}).get("valor")
-		if n:
-			vals[n] = v
-
-	try:
-		with get_connection() as cnx, cnx.cursor(dictionary=True) as cur:
-			cur.execute("""
-				SELECT nome_arquivo, template_html, variaveis_valores
-				  FROM galeria_juridico
-				 WHERE id_template = %s
-			""", (template_id,))
-			row = cur.fetchone()
-			if not row:
-				return jsonify(status="erro", mensagem="Template não encontrado"), 404
-
-		try:
-			comps_json = json.loads(row["template_html"] or "[]")
-			if not isinstance(comps_json, list):
-				comps_json = [{"nome_arquivo": row["nome_arquivo"], "template_html": row["template_html"] or ""}]
-		except Exception:
-			comps_json = [{"nome_arquivo": row["nome_arquivo"], "template_html": row["template_html"] or ""}]
-
-		total = len(comps_json)
-		if not total:
-			return jsonify(status="erro", mensagem="Template sem componentes"), 400
-
-		if not indices:
-			sel = list(range(total))
-		else:
-			try:
-				sel = sorted({int(i) for i in indices})
-			except Exception:
-				return jsonify(status="erro", mensagem="Índices inválidos"), 400
-			sel = [i for i in sel if 0 <= i < total]
-			if not sel:
-				return jsonify(status="erro", mensagem="Nenhum índice válido"), 400
-
-		out_zip = io.BytesIO()
-		with zipfile.ZipFile(out_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-			for i in sel:
-				comp = comps_json[i]
-
-				# Usa override se existir; senão, usa o HTML do banco
-				ov = overrides.get(str(i)) or overrides.get(i)
-				if ov and (ov.get("html") or "").strip():
-					nome_comp = ov.get("nome") or comp.get("nome_arquivo") or f"Componente_{i+1}"
-					html_raw = ov.get("html") or ""
-				else:
-					nome_comp = comp.get("nome_arquivo") or f"Componente_{i+1}"
-					html_raw = comp.get("template_html") or ""
-
-				html_ok = _apply_variables_to_html(html_raw, vals)
-				docx_io = convert_html_to_docx(html_ok)
-
-				if formato == "pdf":
-					file_io = _docx_bytes_to_pdf_bytes(docx_io)
-					ext = "pdf"
-				else:
-					file_io = docx_io
-					ext = "docx"
-
-				filename = _safe_filename(nome_comp, ext)
-				zf.writestr(filename, file_io.getvalue())
-
-		out_zip.seek(0)
-		zip_name = _safe_filename(f"{row.get('nome_arquivo')}_componentes", "zip")
-		return send_file(
-			out_zip,
-			as_attachment=True,
-			download_name=zip_name,
-			mimetype="application/zip"
-		)
-	except Exception:
-		logger.exception("/download_componentes_zip: falha ao gerar ZIP")
-		return jsonify(status="erro", mensagem="Falha ao gerar ZIP"), 500
+    template_id = request.args.get("id", type=int)
+    if not template_id:
+        return jsonify(status="erro", mensagem="ID faltando"), 400
+    try:
+        htmls, vals, nome = _load_componentes_e_variaveis(template_id)
+        if htmls is None:
+            return jsonify(status="erro", mensagem="Template não encontrado"), 404
+        html_fusao = _merge_componentes_com_variaveis(htmls, vals)
+        html_fusao = _coalesce_docx_pagebreaks(html_fusao)
+        html_doc = _wrap_html_for_print(html_fusao)
+        pdf_io = _html_to_pdf_chromium(html_doc)
+        download_name = _safe_filename(nome, "pdf")
+        return send_file(
+            pdf_io,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/pdf"
+        )
+    except Exception:
+        logger.exception("/download_pdf: falha ao gerar PDF")
+        return jsonify(status="erro", mensagem="Falha ao gerar PDF"), 500
 
 # === TASKS / SCHEDULE ===
 def unlock_stale_templates(limite_minutos=10):
